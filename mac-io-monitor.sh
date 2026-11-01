@@ -1,0 +1,126 @@
+#!/bin/bash
+
+set -u
+
+# ============================================================
+# macOS Background Process I/O Monitor
+# Logs are stored in /tmp (tmpfs)
+# ============================================================
+
+LOG_DIR="/tmp/macos-io-monitor"
+
+PROCESSES=(
+    Safari
+    com.apple.WebKit.Networking
+)
+
+mkdir -p "$LOG_DIR"
+
+TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
+
+RAW_LOG="$LOG_DIR/fs_usage-$TIMESTAMP.log"
+WRITE_LOG="$LOG_DIR/write-events-$TIMESTAMP.log"
+SUMMARY="$LOG_DIR/write-paths-$TIMESTAMP.txt"
+
+echo "========================================"
+echo " macOS Background I/O Monitor"
+echo "========================================"
+echo
+echo "Log directory: $LOG_DIR"
+echo "Start time:    $(date)"
+echo
+
+# Require root
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Please run:"
+    echo "sudo bash $0"
+    exit 1
+fi
+
+# Check fs_usage
+if ! command -v fs_usage >/dev/null 2>&1; then
+    echo "fs_usage not found"
+    exit 1
+fi
+
+echo "Monitoring processes:"
+
+for p in "${PROCESSES[@]}"; do
+    printf "  %-28s" "$p"
+
+    if pgrep -x "$p" >/dev/null 2>&1; then
+        echo "RUNNING"
+    else
+        echo "NOT RUNNING (will monitor if supported)"
+    fi
+done
+
+echo
+echo "Raw log:   $RAW_LOG"
+echo "Write log: $WRITE_LOG"
+echo
+echo "Press Ctrl+C to stop and generate reports."
+echo
+
+# Save metadata
+{
+    echo "Start: $(date)"
+    echo "Uptime:"
+    uptime
+    echo
+    echo "Processes:"
+    ps -axo pid,ppid,user,etime,command
+} > "$LOG_DIR/system-$TIMESTAMP.txt"
+
+# Monitor all instances matching process names.
+# fs_usage supports multiple process names.
+fs_usage -w -f filesys "${PROCESSES[@]}" \
+    > "$RAW_LOG" 2>&1
+
+echo
+echo "Monitoring stopped."
+echo "Processing logs..."
+
+# Extract filesystem write-related operations.
+# Keep complete original lines to preserve path and process information.
+awk '
+{
+    op = $2
+
+    if (op ~ /^(write|writev|pwrite|pwritev|pwrite_nocancel|WrData|WrMeta|WrData[A-Za-z]*|WrMeta[A-Za-z]*)$/) {
+        print
+    }
+}
+' "$RAW_LOG" > "$WRITE_LOG"
+
+# Generate unique write-event path candidates.
+# Preserve full events separately because pathname formats can vary.
+awk '
+{
+    if (NF >= 2) {
+        op = $2
+
+        if (op ~ /^(write|writev|pwrite|pwritev|pwrite_nocancel|WrData|WrMeta|WrData[A-Za-z]*|WrMeta[A-Za-z]*)$/) {
+            print
+        }
+    }
+}
+' "$RAW_LOG" | sort -u > "$SUMMARY"
+
+echo
+echo "========================================"
+echo " Monitoring Report"
+echo "========================================"
+
+echo "Raw events:    $(wc -l < "$RAW_LOG")"
+echo "Write events:  $(wc -l < "$WRITE_LOG")"
+echo "Unique events: $(wc -l < "$SUMMARY")"
+
+echo
+echo "Generated files:"
+echo "$RAW_LOG"
+echo "$WRITE_LOG"
+echo "$SUMMARY"
+
+echo
+echo "Finished: $(date)"
