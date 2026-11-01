@@ -12,8 +12,12 @@ import argparse, collections, gzip, os, re, sys
 SPLIT = re.compile(r"\s{2,}")
 FD_RE = re.compile(r"\bF=(\d+)")
 BYTES_RE = re.compile(r"\bB=0x([0-9a-fA-F]+)")
-OPEN_OPS = ("open", "open_dprotected", "open_extended", "openat", "openbyid_np")
-WRITE_OPS = ("write", "pwrite", "writev", "guarded_pwrite_np")
+OPEN_OPS = ("open", "open_dprotected", "open_extended", "openat", "openbyid_np",
+            "open_nocancel", "openat_nocancel", "guarded_open_np", "guarded_open_dpro",
+            "guarded_open_dprotected_np")
+CLOSE_OPS = ("close", "close_nocancel", "close_extended", "guarded_close_np")
+WRITE_OPS = ("write", "pwrite", "writev", "guarded_pwrite_np", "write_nocancel",
+             "pwrite_nocancel", "writev_nocancel", "pwritev_nocancel")
 FLUSH_OPS = ("WrData", "PgOut")
 META_OPS = ("mkdir", "mkdirat", "unlink", "unlinkat", "rename", "renameat", "rmdir")
 HOME = os.path.expanduser("~")
@@ -32,16 +36,24 @@ def fields(line):
 
 
 def is_path(x):
-    return x.startswith("/") and not x.startswith("/dev/")
+    # fs_usage sometimes prints volume-relative paths without the leading slash.
+    return not x.startswith("/dev/") and (x.startswith("/") or
+        (x[0].isalnum() or x[0] in ".~_") and "/" in x and not x.startswith(("D=", "B=")))
 
 
 def collapse(path):
+    # fs_usage prints some volume-relative paths without the leading slash.
+    if not path.startswith("/"):
+        path = "/" + path
     return "~" + path[len(HOME):] if HOME and path.startswith(HOME + "/") else path
 
 
 def open_target(f, seen_paths):
     for x in f:
         if is_path(x):
+            if x.startswith("[") and "/" in x:
+                # openat dirfd form, e.g. [3]/path/to/file
+                return x.split("]", 1)[-1] if "]" in x else x
             return x
     for x in f:
         if "/" in x and not x.startswith(("(", "D=", "B=")):
@@ -87,13 +99,13 @@ def main():
             if fd and len(f) > 3:
                 fd_path[(proc, fd.group(1))] = open_target(f[3:], seen_paths) or "<unknown>"
             continue
-        if op == "close":
+        if op in CLOSE_OPS:
             fd = FD_RE.search(f[2]) if len(f) > 2 else None
             if fd:
                 fd_path.pop((proc, fd.group(1)), None)
             continue
         if op in META_OPS:
-            path = next((x for x in f if is_path(x)), None)
+            path = next((x for x in f if is_path(x) and not x.startswith("[")), None)
             if path:
                 meta[proc.rsplit(".", 1)[0]][os.path.dirname(collapse(path))] += 1
             continue
@@ -129,7 +141,14 @@ def main():
             flush_files[collapse(path)][0] += nbytes
             flush_files[collapse(path)][1] += 1
 
-    span = (min(file_span.values())[0], max(v[1] for v in file_span.values())) if file_span else (0, 0)
+    all_ts = [ts_seconds(f[0]) for line in lines
+              if len(f0 := fields(line)) and len(f0) >= 2 and f0[0][:2].isdigit() and ":" in f0[0]]
+    if all_ts:
+        span = (min(all_ts), max(all_ts))
+    elif file_span:
+        span = (min(file_span.values())[0], max(v[1] for v in file_span.values()))
+    else:
+        span = (0, 0)
     dur = max(span[1] - span[0], 1)
 
     def table(title, tbl):
